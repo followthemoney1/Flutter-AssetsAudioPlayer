@@ -38,6 +38,7 @@ internal val METHOD_PREV = "player.prev"
 internal val METHOD_PLAY_OR_PAUSE = "player.playOrPause"
 internal val METHOD_NOTIFICATION_STOP = "player.stop"
 internal val METHOD_ERROR = "player.error"
+internal val METHOD_EXPIRED = "player.expired"
 
 class AssetsAudioPlayerPlugin : FlutterPlugin, PluginRegistry.NewIntentListener, ActivityAware {
 
@@ -47,25 +48,47 @@ class AssetsAudioPlayerPlugin : FlutterPlugin, PluginRegistry.NewIntentListener,
     companion object {
         var instance: AssetsAudioPlayerPlugin? = null
         var displayLogs = false
+
+        // Process-wide owner decisions and the card-owner record; every notification path reads them.
+        private val enginePort = PluginEnginePort()
+        private val handoff = EngineHandoff(EngineOwnership(), enginePort)
+        private var nextEngineId = 1
+        private var cardOwnerEngineId: Int? = null
+        private var cardOwnerPlayerIdValue: String? = null
+
+        val cardOwnerEngine: Int? get() = cardOwnerEngineId
+        val cardOwnerPlayerId: String? get() = cardOwnerPlayerIdValue
+
+        internal fun log(line: String) {
+            Log.d("AssetsAudioPlayer", "[aap] $line")
+        }
+
+        internal fun recordCardOwner(engineId: Int, playerId: String) {
+            cardOwnerEngineId = engineId
+            cardOwnerPlayerIdValue = playerId
+            log("card owner player=$playerId engine=$engineId")
+        }
     }
 
     var assetsAudioPlayer: AssetsAudioPlayer? = null
 
+    private val engineId: Int = nextEngineId++
+
     override fun onAttachedToEngine(@NonNull flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
-        if(instance != null)return // bug fix
-        instance = this
+        enginePort.plugins[engineId] = this
         notificationChannel = MethodChannel(flutterPluginBinding.binaryMessenger, "assets_audio_player_notification")
         assetsAudioPlayer = AssetsAudioPlayer(
+                engineId = engineId,
                 flutterAssets = flutterPluginBinding.flutterAssets,
                 context = flutterPluginBinding.applicationContext,
                 messenger = flutterPluginBinding.binaryMessenger
         )
-        assetsAudioPlayer!!.register();
+        handoff.engineAttached(engineId)
     }
 
     override fun onDetachedFromEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
-        assetsAudioPlayer?.unregister()
-        instance = null
+        handoff.engineDetached(engineId)
+        enginePort.plugins.remove(engineId)
     }
 
     private fun sendNotificationPayloadMessage(intent: Intent): Boolean? {
@@ -102,7 +125,8 @@ class AssetsAudioPlayerPlugin : FlutterPlugin, PluginRegistry.NewIntentListener,
 
     override fun onAttachedToActivity(binding: ActivityPluginBinding) {
         binding.addOnNewIntentListener(this)
-        myActivity = binding.activity;
+        myActivity = binding.activity
+        handoff.activityAttached(engineId)
     }
 
     override fun onDetachedFromActivityForConfigChanges() {
@@ -110,7 +134,69 @@ class AssetsAudioPlayerPlugin : FlutterPlugin, PluginRegistry.NewIntentListener,
     }
 }
 
+/**
+ * Process-wide port of [EngineHandoff]: every primitive is one call on the named engine's
+ * [AssetsAudioPlayer], plus the static `instance` write that notification paths resolve through.
+ */
+private class PluginEnginePort : EngineHandoff.Port {
+
+    val plugins = mutableMapOf<Int, AssetsAudioPlayerPlugin>()
+
+    private fun player(engineId: Int): AssetsAudioPlayer? = plugins[engineId]?.assetsAudioPlayer
+
+    override fun publishOwner(engineId: Int?) {
+        AssetsAudioPlayerPlugin.instance = engineId?.let { plugins[it] }
+    }
+
+    override fun setMethodHandler(engineId: Int) {
+        player(engineId)?.setMethodHandler()
+    }
+
+    override fun clearMethodHandler(engineId: Int) {
+        player(engineId)?.clearMethodHandler()
+    }
+
+    override fun startHeadsetManager(engineId: Int) {
+        player(engineId)?.startHeadsetManager()
+    }
+
+    override fun stopHeadsetManager(engineId: Int) {
+        player(engineId)?.stopHeadsetManager()
+    }
+
+    override fun registerFocusListener(engineId: Int) {
+        player(engineId)?.registerFocusListener()
+    }
+
+    override fun unregisterFocusListener(engineId: Int) {
+        player(engineId)?.unregisterFocusListener()
+    }
+
+    override fun registerMediaButtons(engineId: Int) {
+        player(engineId)?.registerMediaButtons()
+    }
+
+    override fun abandonFocus(engineId: Int) {
+        player(engineId)?.abandonFocus()
+    }
+
+    override fun stopPlayers(engineId: Int) {
+        player(engineId)?.stopPlayers()
+    }
+
+    override fun cardOwnerEngine(): Int? = AssetsAudioPlayerPlugin.cardOwnerEngine
+
+    override fun closeCardService() {
+        AssetsAudioPlayerPlugin.instance?.assetsAudioPlayer?.closeCardService()
+    }
+
+    override fun log(line: String) {
+        AssetsAudioPlayerPlugin.log(line)
+    }
+}
+
 class AssetsAudioPlayer(
+        private val engineId: Int,
         private val context: Context,
         private val messenger: BinaryMessenger,
         private val flutterAssets: FlutterPlugin.FlutterAssets
@@ -137,12 +223,38 @@ class AssetsAudioPlayer(
 
     private var lastPlayerIdWithNotificationEnabled: String? = null
 
-    fun register() {
-        stopWhenCall.register(stopWhenCallListener)
+    private val methodChannel = MethodChannel(messenger, "assets_audio_player")
 
+    fun setMethodHandler() {
+        methodChannel.setMethodCallHandler(this)
+    }
+
+    fun clearMethodHandler() {
+        methodChannel.setMethodCallHandler(null)
+    }
+
+    fun startHeadsetManager() {
         headsetManager.onHeadsetPluggedListener = onHeadsetPluggedListener
         headsetManager.start()
+    }
 
+    fun stopHeadsetManager() {
+        headsetManager.stop()
+    }
+
+    fun registerFocusListener() {
+        stopWhenCall.register(stopWhenCallListener)
+    }
+
+    fun unregisterFocusListener() {
+        stopWhenCall.unregister(stopWhenCallListener)
+    }
+
+    fun abandonFocus() {
+        stopWhenCall.stop()
+    }
+
+    fun registerMediaButtons() {
         mediaButtonsReceiver = MediaButtonsReceiver(context,
                 onAction = {
                     onMediaButton(it)
@@ -151,21 +263,17 @@ class AssetsAudioPlayer(
                     onNotifSeekPlayer(position)
                 }
         )
-
-        val channel = MethodChannel(messenger, "assets_audio_player")
-        channel.setMethodCallHandler(this)
-
-        //stopWhenCall?.requestAudioFocus()
     }
 
-    fun unregister() {
-        stopWhenCall.stop()
-        notificationManager.hideNotificationService(definitively = true)
-        stopWhenCall.unregister(stopWhenCallListener)
+    fun stopPlayers() {
         players.values.forEach {
             it.stop()
         }
         players.clear()
+    }
+
+    fun closeCardService() {
+        notificationManager.hideNotificationService(definitively = true)
     }
 
     private val players = mutableMapOf<String, Player>()
@@ -210,6 +318,9 @@ class AssetsAudioPlayer(
                 }
                 onPlaying = {
                     channel.invokeMethod(METHOD_IS_PLAYING, it)
+                }
+                onExpired = {
+                    channel.invokeMethod(METHOD_EXPIRED, null)
                 }
                 onBuffering = {
                     channel.invokeMethod(METHOD_IS_BUFFERING, it)
@@ -294,6 +405,29 @@ class AssetsAudioPlayer(
                     }
                     val removeNotification = args["removeNotification"] as? Boolean ?: true
                     getOrCreatePlayer(id).stop(removeNotification = removeNotification)
+                    result.success(null)
+                } ?: run {
+                    result.error("WRONG_FORMAT", "The specified argument must be an Map<*, Any>.", null)
+                    return
+                }
+            }
+            "prepareForegroundPlayback" -> {
+                (call.arguments as? Map<*, *>)?.let { args ->
+                    val id = args["id"] as? String ?: run {
+                        result.error("WRONG_FORMAT", "The specified argument (id) must be an String.", null)
+                        return
+                    }
+                    val notificationSettings = fetchNotificationSettings(args)
+                    val audioMetas = fetchAudioMetas(args).let { meta ->
+                        meta.copy(
+                                image = meta.image?.let { img ->
+                                    img.copy(
+                                            imagePath = uriResolver.imagePath(img.imagePath)
+                                    )
+                                }
+                        )
+                    }
+                    getOrCreatePlayer(id).prepareForegroundPlayback(audioMetas, notificationSettings)
                     result.success(null)
                 } ?: run {
                     result.error("WRONG_FORMAT", "The specified argument must be an Map<*, Any>.", null)
@@ -556,6 +690,7 @@ class AssetsAudioPlayer(
 
     fun registerLastPlayerWithNotif(playerId: String) {
         this.lastPlayerIdWithNotificationEnabled = playerId
+        AssetsAudioPlayerPlugin.recordCardOwner(engineId, playerId)
     }
 
     fun onMediaButton(action: MediaButtonsReceiver.MediaButtonAction) {

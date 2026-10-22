@@ -10,9 +10,12 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.media.MediaMetadata
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.IBinder
 import android.support.v4.media.MediaMetadataCompat
 import android.support.v4.media.session.PlaybackStateCompat
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.media.session.MediaButtonReceiver
@@ -35,6 +38,8 @@ class NotificationService : Service() {
         const val NOTIFICATION_ID = 1
         const val CHANNEL_ID = "assets_audio_player"
         const val MEDIA_SESSION_TAG = "assets_audio_player"
+        const val PAUSED_FOREGROUND_MS = 10 * 60 * 1000L
+        const val TAG = "AssetsAudioPlayer"
 
         const val EXTRA_PLAYER_ID = "playerId"
         const val EXTRA_NOTIFICATION_ACTION = "notificationAction"
@@ -58,11 +63,11 @@ class NotificationService : Service() {
             return abs(new.position - currentPos) > minDifferenceMS
         }
 
-        fun updatePosition(context: Context, isPlaying: Boolean, currentPositionMs: Long, speed: Float) {
+        fun updatePosition(context: Context, isPlaying: Boolean, currentPositionMs: Long, speed: Float, actions: Long) {
             MediaButtonsReceiver.getMediaSessionCompat(context).let { mediaSession ->
                 val state = if (isPlaying) PlaybackStateCompat.STATE_PLAYING else PlaybackStateCompat.STATE_PAUSED
                 val newState = PlaybackStateCompat.Builder()
-                        .setActions(PlaybackStateCompat.ACTION_PLAY or PlaybackStateCompat.ACTION_PLAY_PAUSE or PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS or PlaybackStateCompat.ACTION_SKIP_TO_NEXT or PlaybackStateCompat.ACTION_SEEK_TO)
+                        .setActions(actions)
                         .setState(state, currentPositionMs, if (isPlaying) speed else 0f)
                         .build()
 
@@ -115,6 +120,9 @@ class NotificationService : Service() {
         }
     }
 
+    private val handler = Handler(Looper.getMainLooper())
+    private val leaveForeground = Runnable { if (Build.VERSION.SDK_INT >= 24) stopForeground(STOP_FOREGROUND_DETACH) }
+
     @RequiresApi(Build.VERSION_CODES.ECLAIR)
     override fun onStartCommand(intent: Intent, flags: Int, startId: Int): Int {
         if (intent.action == Intent.ACTION_MEDIA_BUTTON) {
@@ -165,7 +173,7 @@ class NotificationService : Service() {
     }
 
     private fun getSmallIcon(context: Context): Int {
-        return android.R.drawable.ic_media_play
+        return getCustomIconOrDefault(context, manifestIcon, null, android.R.drawable.ic_media_play)
     }
     
     private fun getPlayIcon(context: Context, resourceName: String?): Int {
@@ -347,16 +355,13 @@ class NotificationService : Service() {
                 .setShowWhen(false)
                 .build()
 
-        if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(NOTIFICATION_ID, notification, FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+        handler.removeCallbacks(leaveForeground)
+        if (startForegroundOrNotify(notification)) {
+            // Foreground reached: a play denied by background-start limits may consume its one retry.
+            player.onServiceForeground()
         }
-
-        //fix for https://github.com/florent37/Flutter-AssetsAudioPlayer/issues/139
-        if (!action.isPlaying && Build.VERSION.SDK_INT >= 24) {
-           stopForeground(STOP_FOREGROUND_DETACH)
-        }
+        // A paused player stays foreground for a while: Android 12+ refuses a re-promotion from the background.
+        if (!action.isPlaying) handler.postDelayed(leaveForeground, PAUSED_FOREGROUND_MS)
 
     }
 
@@ -378,8 +383,23 @@ class NotificationService : Service() {
         }
     }
 
+    /** True when startForeground succeeded; false when the system refused and only the notification posted. */
+    private fun startForegroundOrNotify(notification: Notification): Boolean {
+        return try {
+            if (Build.VERSION.SDK_INT >= 29) startForeground(NOTIFICATION_ID, notification, FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+            else startForeground(NOTIFICATION_ID, notification)
+            true
+        } catch (e: IllegalStateException) {
+            // Android 12+ refuses startForeground from the background; keep the media controls anyway.
+            Log.w(TAG, "startForeground refused", e)
+            NotificationManagerCompat.from(this).notify(NOTIFICATION_ID, notification)
+            false
+        }
+    }
+
     @RequiresApi(Build.VERSION_CODES.ECLAIR)
     private fun hideNotif() {
+        handler.removeCallbacks(leaveForeground)
         NotificationManagerCompat.from(applicationContext).cancel(NOTIFICATION_ID)
         stopForeground(true)
         stopSelf()
@@ -399,6 +419,7 @@ class NotificationService : Service() {
     }
 
     override fun onDestroy() {
+        handler.removeCallbacks(leaveForeground)
         super.onDestroy()
     }
 

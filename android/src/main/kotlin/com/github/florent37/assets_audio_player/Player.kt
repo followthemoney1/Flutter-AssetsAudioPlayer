@@ -5,6 +5,8 @@ import android.content.Intent
 import android.media.AudioManager
 import android.os.Handler
 import android.os.Message
+import android.util.Log
+import android.support.v4.media.session.PlaybackStateCompat
 import com.github.florent37.assets_audio_player.headset.HeadsetStrategy
 import com.github.florent37.assets_audio_player.notification.AudioMetas
 import com.github.florent37.assets_audio_player.notification.NotificationManager
@@ -35,6 +37,9 @@ class Player(
     companion object {
         const val VOLUME_WHEN_REDUCED = 0.3
 
+        /** A prepared card expires 60 s after it is shown unless playback starts for its generation. */
+        const val PREPARE_BOUND_MS = 60_000L
+
         const val AUDIO_TYPE_NETWORK = "network"
         const val AUDIO_TYPE_LIVESTREAM = "liveStream"
         const val AUDIO_TYPE_FILE = "file"
@@ -58,6 +63,9 @@ class Player(
     var onPositionMSChanged: ((Long) -> Unit)? = null
     var onFinished: (() -> Unit)? = null
     var onPlaying: ((Boolean) -> Unit)? = null
+
+    /** The accepted transport was released by the prepared bound's expiry; the playlist is no longer playable. */
+    var onExpired: (() -> Unit)? = null
     var onBuffering: ((Boolean) -> Unit)? = null
     var onError: ((AssetAudioPlayerThrowable) -> Unit)? = null
     var onNext: (() -> Unit)? = null
@@ -76,6 +84,138 @@ class Player(
 
     private var isEnabledToPlayPause: Boolean = true
     private var isEnabledToChangeVolume: Boolean = true
+
+    private val focusCoordinator = FocusCoordinator(PlaybackFocusIntent(), PlayerFocusPort())
+
+    private val attemptSession = PlaybackAttemptSession(
+            playerId = id,
+            bound = PreparationBound(),
+            port = PlayerAttemptPort(),
+            boundMs = PREPARE_BOUND_MS
+    )
+
+    /** Drives the attempt session's effects; every method is one platform call or one read. */
+    private inner class PlayerAttemptPort : PlaybackAttemptSession.Port {
+        override fun showPreparedCard(playing: Boolean) {
+            this@Player.audioMetas?.takeIf { this@Player.notificationSettings != null }?.let { audioMetas ->
+                notificationManager.showNotification(
+                        playerId = id,
+                        audioMetas = audioMetas,
+                        isPlaying = playing,
+                        notificationSettings = this@Player.notificationSettings!!,
+                        stop = false,
+                        durationMs = 0
+                )
+            }
+        }
+
+        override fun publishPreparedPlaybackState(playing: Boolean) {
+            NotificationService.updatePosition(
+                    context = context,
+                    isPlaying = playing,
+                    currentPositionMs = 0,
+                    speed = 1f,
+                    actions = preparedPlaybackActions(notificationSettings)
+            )
+        }
+
+        override fun cardOwnerPlayerId(): String? {
+            return AssetsAudioPlayerPlugin.cardOwnerPlayerId
+        }
+
+        override fun hideCard() {
+            notificationManager.stopNotification()
+        }
+
+        override fun publishTransport(player: PlayerImplem) {
+            this@Player.mediaPlayer = player
+        }
+
+        override fun releaseTransport(player: PlayerImplem) {
+            this@Player.releaseTransport(player)
+        }
+
+        override fun notifyTransportExpired() {
+            this@Player.onExpired?.invoke()
+        }
+
+        override fun playTransport() {
+            this@Player.playTransport()
+        }
+
+        override fun pauseTransport() {
+            focusCoordinator.pause()
+        }
+
+        override fun acknowledgeForeground() {
+            focusCoordinator.onServiceForeground()
+        }
+
+        override fun schedule(delayMs: Long, action: () -> Unit): PlaybackAttemptSession.Cancellable {
+            val runnable = Runnable { action() }
+            handler.postDelayed(runnable, delayMs)
+            return PlaybackAttemptSession.Cancellable { handler.removeCallbacks(runnable) }
+        }
+
+        override fun log(line: String) {
+            Log.d("AssetsAudioPlayer", "[aap] $line")
+        }
+    }
+
+    /**
+     * Shows the media notification before the first open, so a slow load still runs in the foreground.
+     */
+    fun prepareForegroundPlayback(audioMetas: AudioMetas, notificationSettings: NotificationSettings) {
+        this.audioMetas = audioMetas
+        this.notificationSettings = notificationSettings
+        attemptSession.prepare()
+    }
+
+    private fun openReply(result: MethodChannel.Result): PlaybackAttemptSession.OpenReply {
+        return object : PlaybackAttemptSession.OpenReply {
+            override fun success() {
+                result.success(null)
+            }
+
+            override fun error(code: String, message: String?) {
+                result.error(code, message, null)
+            }
+        }
+    }
+
+    /** The notification service reached the foreground for this player's card; consume the focus retry. */
+    fun onServiceForeground() {
+        attemptSession.onServiceForeground()
+    }
+
+    /** Applies the focus decisions to this player's transport, card and shared focus request. */
+    private inner class PlayerFocusPort : FocusCoordinator.Port {
+        override fun requestFocus(): StopWhenCall.AudioState {
+            return this@Player.stopWhenCall.requestAudioFocus(audioFocusStrategy)
+        }
+
+        override fun startTransport() {
+            this@Player.isEnabledToPlayPause = true //this one must be called before play/pause()
+            this@Player.isEnabledToChangeVolume = true //this one must be called before play/pause()
+            playerPlay()
+        }
+
+        override fun pauseTransport() {
+            this@Player.pauseTransport()
+        }
+
+        override fun isTransportPlaying(): Boolean {
+            return isPlaying
+        }
+
+        override fun promoteCard() {
+            updateNotif()
+        }
+
+        override fun log(line: String) {
+            Log.d("AssetsAudioPlayer", "[aap] $line")
+        }
+    }
 
     val isPlaying: Boolean
         get() = mediaPlayer != null && mediaPlayer!!.isPlaying
@@ -171,7 +311,6 @@ class Player(
         } catch (t: Throwable){
             print(t)
         }
-
         this.displayNotification = displayNotification
         this.audioMetas = audioMetas
         this.notificationSettings = notificationSettings
@@ -181,6 +320,10 @@ class Player(
 
         _lastOpenedPath = assetAudioPath
       
+        if (displayNotification && autoStart) {
+            notificationManager.showNotification(playerId = id, audioMetas = audioMetas, isPlaying = true, notificationSettings = notificationSettings, stop = false, durationMs = 0)
+        }
+        val attempt = attemptSession.openStarted(openReply(result))
         GlobalScope.launch(Dispatchers.Main) {
             try {
                 val playerWithDuration = PlayerFinder.findWorkingPlayer(
@@ -192,7 +335,8 @@ class Player(
                         networkHeaders = networkHeaders,
                         context = context,
                         onFinished = {
-                            stopWhenCall.stop()
+                            // Players share one focus request; only a player that requested focus may abandon it.
+                            if (audioFocusStrategy is AudioFocusStrategy.Request) stopWhenCall.stop()
                             onFinished?.invoke()
                         },
                         onPlaying = onPlaying,
@@ -203,7 +347,12 @@ class Player(
                 )
 
                 val durationMs = playerWithDuration.duration
-                mediaPlayer = playerWithDuration.player
+                val openedPlayer = playerWithDuration.player
+
+                if (!attemptSession.openSucceeded(attempt, openedPlayer)) {
+                    // The pending open was already answered; the session released the late player.
+                    return@launch
+                }
 
                 //here one open succeed
                 onReadyToPlay?.invoke(durationMs)
@@ -227,42 +376,45 @@ class Player(
                 } else {
                     updateNotif() //if pause, we need to display the notif
                 }
-                result.success(null)
             } catch (error: Throwable) {
                 error.printStackTrace()
-                if(error is PlayerFinder.NoPlayerFoundException && error.why != null){
-                    result.error("OPEN", error.why.message, mapOf(
-                            "type" to error.why.type,
-                            "message" to error.why.message
-                    ))
-                } else {
-                    result.error("OPEN", error.message, null)
-                }
+                attemptSession.openFailed(attempt, error)
             }
         }
     }
 
     fun stop(pingListener: Boolean = true, removeNotification: Boolean = true) {
-        mediaPlayer?.apply {
+        if (pingListener) { // action from user
+            onStop?.invoke()
+            attemptSession.terminalStop("user-stop")
+            updateNotif(removeNotificationOnStop = removeNotification)
+        } else {
+            attemptSession.replacement()
+        }
+    }
+
+    private fun releaseTransport(player: PlayerImplem) {
+        if (mediaPlayer === player) {
+            focusCoordinator.stop()
+
             // Reset duration and position.
             // handler.removeCallbacks(updatePosition);
             // channel.invokeMethod("player.duration", 0);
             onPositionMSChanged?.invoke(0)
-
-            mediaPlayer?.stop()
-            mediaPlayer?.release()
-            onPlaying?.invoke(false)
             handler.removeCallbacks(updatePosition)
+
+            if (forwardHandler != null) {
+                forwardHandler!!.stop()
+                forwardHandler = null
+            }
+            mediaPlayer = null
+            onForwardRewind?.invoke(0.0)
+            onPlaying?.invoke(false)
         }
-        if (forwardHandler != null) {
-            forwardHandler!!.stop()
-            forwardHandler = null
-        }
-        mediaPlayer = null
-        onForwardRewind?.invoke(0.0)
-        if (pingListener) { //action from user
-            onStop?.invoke()
-            updateNotif(removeNotificationOnStop= removeNotification)
+        try {
+            player.stop()
+        } finally {
+            player.release()
         }
     }
 
@@ -286,13 +438,13 @@ class Player(
     private fun updateNotifPosition() {
         this.audioMetas
                 ?.takeIf { this.displayNotification }
-                ?.takeIf { notificationSettings?.seekBarEnabled ?: true }
                 ?.let { audioMetas ->
                     NotificationService.updatePosition(
                             context = context,
                             isPlaying = isPlaying,
                             speed = this.playSpeed.toFloat(),
-                            currentPositionMs = _positionMs
+                            currentPositionMs = _positionMs,
+                            actions = preparedPlaybackActions(notificationSettings)
                     )
         }
     }
@@ -341,17 +493,16 @@ class Player(
     }
 
     fun play() {
+        attemptSession.play()
+    }
+
+    private fun playTransport() {
         if(audioFocusStrategy is AudioFocusStrategy.None){
             this.isEnabledToPlayPause = true //this one must be called before play/pause()
             this.isEnabledToChangeVolume = true //this one must be called before play/pause()
             playerPlay()
         } else {
-            val audioState = this.stopWhenCall.requestAudioFocus(audioFocusStrategy)
-            if (audioState == StopWhenCall.AudioState.AUTHORIZED_TO_PLAY) {
-                this.isEnabledToPlayPause = true //this one must be called before play/pause()
-                this.isEnabledToChangeVolume = true //this one must be called before play/pause()
-                playerPlay()
-            } //else will wait until focus is enabled
+            focusCoordinator.play()
         }
     }
 
@@ -362,6 +513,7 @@ class Player(
                 player.play()
                 _lastPositionMs = null
                 handler.post(updatePosition)
+                attemptSession.playbackStarted() // the first playback start disarms the prepared bound
                 onPlaying?.invoke(true)
                 updateNotif()
             }
@@ -371,6 +523,10 @@ class Player(
     }
 
     fun pause() {
+        attemptSession.pause()
+    }
+
+    private fun pauseTransport() {
         if (isEnabledToPlayPause) {
             mediaPlayer?.let {
                 it.pause()
@@ -465,27 +621,16 @@ class Player(
     }
 
     private var volumeBeforePhoneStateChanged: Double? = null
-    private var wasPlayingBeforeEnablePlayChange: Boolean? = null
     fun updateEnableToPlay(audioState: StopWhenCall.AudioState) {
         (audioFocusStrategy as? AudioFocusStrategy.Request)?.let { audioFocusStrategy ->
             when (audioState) {
                 StopWhenCall.AudioState.AUTHORIZED_TO_PLAY -> {
                     this.isEnabledToPlayPause = true //this one must be called before play/pause()
                     this.isEnabledToChangeVolume = true //this one must be called before play/pause()
-                    if(audioFocusStrategy.resumeAfterInterruption) {
-                        wasPlayingBeforeEnablePlayChange?.let {
-                            //phone call ended
-                            if (it) {
-                                playerPlay()
-                            } else {
-                                pause()
-                            }
-                        }
-                    }
+                    focusCoordinator.onFocusChange(audioState, audioFocusStrategy.resumeAfterInterruption)
                     volumeBeforePhoneStateChanged?.let {
                         setVolume(it)
                     }
-                    wasPlayingBeforeEnablePlayChange = null
                     volumeBeforePhoneStateChanged = null
                 }
                 StopWhenCall.AudioState.REDUCE_VOLUME -> {
@@ -494,8 +639,7 @@ class Player(
                     this.isEnabledToChangeVolume = false //this one must be called after setVolume()
                 }
                 StopWhenCall.AudioState.FORBIDDEN -> {
-                    wasPlayingBeforeEnablePlayChange = this.isPlaying
-                    pause()
+                    focusCoordinator.onFocusChange(audioState, audioFocusStrategy.resumeAfterInterruption)
                     this.isEnabledToPlayPause = false //this one must be called after pause()
                 }
             }
@@ -568,4 +712,13 @@ class ForwardHandler : Handler() {
             }
         }
     }
+}
+
+/** The actions a prepared card's media session advertises, mapped purely from the notification settings. */
+fun preparedPlaybackActions(settings: NotificationSettings?): Long {
+    var actions = PlaybackStateCompat.ACTION_PLAY or PlaybackStateCompat.ACTION_PAUSE or PlaybackStateCompat.ACTION_PLAY_PAUSE
+    if (settings?.prevEnabled == true) actions = actions or PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS
+    if (settings?.nextEnabled == true) actions = actions or PlaybackStateCompat.ACTION_SKIP_TO_NEXT
+    if (settings?.seekBarEnabled == true) actions = actions or PlaybackStateCompat.ACTION_SEEK_TO
+    return actions
 }

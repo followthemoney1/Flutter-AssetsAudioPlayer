@@ -7,6 +7,7 @@ import FlutterMacOS
 #endif
 
 import MediaPlayer
+import os.log
 
 struct NotificationSettings : Equatable {
     let nextEnabled: Bool
@@ -496,6 +497,7 @@ public class Player : NSObject, AVAudioPlayerDelegate {
               displayNotification: Bool,
               notificationSettings: NotificationSettings,
               audioFocusStrategy: AudioFocusStrategy,
+              hasPlayingFocusOwner: Bool,
               playSpeed: Double,
               networkHeaders: NSDictionary?,
               result: @escaping FlutterResult
@@ -519,15 +521,16 @@ public class Player : NSObject, AVAudioPlayerDelegate {
             print("url: " + url.absoluteString)
             
             /* set session category and mode with options */
-            if #available(iOS 10.0, *) {
-                //try AVAudioSession.sharedInstance().setCategory(category, mode: mode, options: [.mixWithOthers])
-                try AVAudioSession.sharedInstance().setCategory(category, mode: .default, options: [])
-                try AVAudioSession.sharedInstance().setActive(true)
-            } else {
-                
-                try AVAudioSession.sharedInstance().setCategory(category)
-                try AVAudioSession.sharedInstance().setActive(true)
-                
+            let isOverlay = !audioFocusStrategy.request && !displayNotification
+            if !(isOverlay && hasPlayingFocusOwner) {
+                let session = AVAudioSession.sharedInstance()
+                let options: AVAudioSession.CategoryOptions = isOverlay ? [.mixWithOthers] : []
+                if #available(iOS 10.0, *) {
+                    try session.setCategory(category, mode: .default, options: options)
+                } else {
+                    try session.setCategory(category, options: options)
+                }
+                try session.setActive(true)
             }
             #endif
             
@@ -583,17 +586,18 @@ public class Player : NSObject, AVAudioPlayerDelegate {
                         self?.channel.invokeMethod(Music.METHOD_CURRENT, arguments: ["totalDurationMs": 0.0])
                         self?.currentSongDurationMs = Float64(0.0)
                         self?.isLiveStream = true
-                        #if os(iOS)
-                        self?.setupMediaPlayerNotificationView(notificationSettings: notificationSettings, audioMetas: audioMetas, isPlaying: false)
-                        #endif
                     } else {
                         let audioDurationMs = self?.getMillisecondsFromCMTime(item.duration) ?? 0
                         self?.channel.invokeMethod(Music.METHOD_CURRENT, arguments: ["totalDurationMs": audioDurationMs])
                         self?.currentSongDurationMs = audioDurationMs
-                        #if os(iOS)
-                        self?.setupMediaPlayerNotificationView(notificationSettings: notificationSettings, audioMetas: audioMetas, isPlaying: false)
-                        #endif
                     }
+                    
+                    #if os(iOS)
+                    // An overlay must not reset the shared session or the remote commands the music owns.
+                    if !isOverlay {
+                        self?.setupMediaPlayerNotificationView(notificationSettings: notificationSettings, audioMetas: audioMetas, isPlaying: false)
+                    }
+                    #endif
                     
                     self?.setPlaySpeed(playSpeed: playSpeed)
                     
@@ -741,8 +745,8 @@ public class Player : NSObject, AVAudioPlayerDelegate {
         switch type {
             
         case .began:
-            // An interruption began. Update the UI as needed.
-            pause()
+            // Only the app's own pause or stop clears the request, so repeated began events keep the resume.
+            pausePlayback()
             
         case .ended:
             // An interruption ended. Resume playback, if appropriate.
@@ -750,7 +754,7 @@ public class Player : NSObject, AVAudioPlayerDelegate {
             guard let optionsValue = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt else { return }
             let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
             if options.contains(.shouldResume) {
-                if(self.audioFocusStrategy.resumeAfterInterruption) {
+                if(self.audioFocusStrategy.resumeAfterInterruption && self.isPlayRequested) {
                     self.invokeListenerPlayPause()
                 }
                 // Interruption ended. Playback should resume.
@@ -812,6 +816,7 @@ public class Player : NSObject, AVAudioPlayerDelegate {
     }
     
     func stop(){
+        isPlayRequested = false
         self.player?.pause()
         self.player?.rate = 0.0
         self.playing = false
@@ -832,11 +837,34 @@ public class Player : NSObject, AVAudioPlayerDelegate {
         self.observerStatus.removeAll()
         #if os(iOS)
         self.nowPlayingInfo.removeAll()
+        if(self.displayMediaPlayerNotification){
+            // Only the player that showed the card may clear the shared center; a cue player must leave it alone.
+            self.deinitMediaPlayerNotifEvent()
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = [:]
+        }
         #endif
         self.player = nil
     }
     
     func play(){
+        isPlayRequested = true
+        #if os(iOS)
+        if self.audioFocusStrategy.request && self.displayMediaPlayerNotification {
+            do {
+                let session = AVAudioSession.sharedInstance()
+                if #available(iOS 10.0, *) {
+                    try session.setCategory(.playback, mode: .default, options: [])
+                } else {
+                    try session.setCategory(.playback, options: [])
+                }
+                try session.setActive(true)
+            } catch let error {
+                // The Dart log channel ends in print; a restore failure must reach the structured sink only.
+                os_log("Audio session restore failed: %{public}@", type: .error, error.localizedDescription)
+            }
+        }
+        #endif
+
         if #available(iOS 10.0, macOS 10.12, *) {
             self.player?.playImmediately(atRate: self.rate)
         } else {
@@ -918,6 +946,7 @@ public class Player : NSObject, AVAudioPlayerDelegate {
     }
     
     var _playing : Bool = false
+    var isPlayRequested = false
     var playing : Bool {
         get {
             return _playing
@@ -957,6 +986,11 @@ public class Player : NSObject, AVAudioPlayerDelegate {
     }
     
     func pause(){
+        isPlayRequested = false
+        pausePlayback()
+    }
+    
+    private func pausePlayback(){
         self.player?.pause()
         
 //        self.updateNotifStatus(playing: false, stopped: false, rate: 0)
@@ -1442,6 +1476,10 @@ class Music : NSObject, FlutterPlugin {
                 let notifSettings = notificationSettings(from: args)
                 
                 let audioFocusStrategy = parseAudioFocusStrategy(args["audioFocusStrategy"] as? NSDictionary)
+                let hasPlayingFocusOwner = self.players.contains { entry in
+                    // rate stays at the requested speed while the music buffers; playing reads false then.
+                    entry.key != id && (entry.value.player?.rate ?? 0) != 0 && entry.value.audioFocusStrategy.request
+                }
                 
                 self.getOrCreatePlayer(id: id)
                     .open(
@@ -1456,6 +1494,7 @@ class Music : NSObject, FlutterPlugin {
                         displayNotification: displayNotification,
                         notificationSettings: notifSettings,
                         audioFocusStrategy: audioFocusStrategy,
+                        hasPlayingFocusOwner: hasPlayingFocusOwner,
                         playSpeed: playSpeed,
                         networkHeaders: networkHeaders,
                         result: result
